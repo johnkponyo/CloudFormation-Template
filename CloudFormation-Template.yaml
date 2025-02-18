@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Setup IAM Users with Groups and Event-Driven Password Notification'
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: UserCreationNotificationFunction
+    Description: Name of the Lambda function
+
+Resources:
+  # Create CloudWatch Log Group explicitly with static name
+  UserCreationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      RetentionInDays: 14
+
+  # Generate a random password and store in Secrets Manager
+  TemporaryPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      Description: Temporary password for IAM users
+
+  # Create S3 Read-Only Group
+  S3UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: S3ReadOnlyGroup
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  # Create EC2 Read-Only Group
+  EC2UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: EC2ReadOnlyGroup
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  # Create S3 User
+  S3User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: s3-user
+      Groups:
+        - !Ref S3UserGroup
+      LoginProfile:
+        Password: !Join ['', ['{{resolve:secretsmanager:', !Ref TemporaryPassword, ':SecretString}}']]
+        PasswordResetRequired: true
+
+  # Create EC2 User
+  EC2User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: ec2-user
+      Groups:
+        - !Ref EC2UserGroup
+      LoginProfile:
+        Password: !Join ['', ['{{resolve:secretsmanager:', !Ref TemporaryPassword, ':SecretString}}']]
+        PasswordResetRequired: true
+
+  # Store user emails in Parameter Store
+  S3UserEmail:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /iam/s3-user/email
+      Type: String
+      Value: s3user@kponyojdk.com
+      Description: Email address for s3-user
+
+  EC2UserEmail:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /iam/ec2-user/email
+      Type: String
+      Value: ec2user@kponyojdk.com
+      Description: Email address for ec2-user
+
+  # Lambda execution role with updated CloudWatch Logs permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UserCreationNotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/iam/*
+                  - !Ref TemporaryPassword
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*
+
+  # Lambda function for user creation notification with updated code
+  UserCreationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ssm = new AWS.SSM();
+          const secretsManager = new AWS.SecretsManager();
+          const cloudWatchLogs = new AWS.CloudWatchLogs();
+
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const username = event.detail.requestParameters.userName;
+              if (!username) return;
+              
+              try {
+                  // Get user email from Parameter Store
+                  const emailParam = await ssm.getParameter({
+                      Name: `/iam/${username}/email`
+                  }).promise();
+                  
+                  // Get temporary password
+                  const secret = await secretsManager.getSecretValue({
+                      SecretId: process.env.SECRET_ARN
+                  }).promise();
+                  
+                  // Prepare log message
+                  const logMessage = {
+                      timestamp: Date.now(),
+                      message: JSON.stringify({
+                          username: username,
+                          email: emailParam.Parameter.Value,
+                          temporaryPassword: secret.SecretString
+                      }, null, 2)
+                  };
+
+                  // Log to specific log stream
+                  await cloudWatchLogs.putLogEvents({
+                      logGroupName: `/aws/lambda/${process.env.AWS_LAMBDA_FUNCTION_NAME}`,
+                      logStreamName: 'test',
+                      logEvents: [{
+                          timestamp: logMessage.timestamp,
+                          message: logMessage.message
+                      }]
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      body: 'Successfully logged user creation details'
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  throw error;
+              }
+          };
+      Runtime: nodejs18.x
+      Timeout: 30
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref TemporaryPassword
+
+  # EventBridge rule to detect user creation
+  UserCreationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to detect IAM user creation"
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - CreateUser
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt UserCreationFunction.Arn
+          Id: "UserCreationFunction"
+
+  # Lambda permission for EventBridge
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaFunctionName
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserCreationRule.Arn
+
+Outputs:
+  TemporaryPasswordSecret:
+    Description: ARN of the secret containing the temporary password
+    Value: !Ref TemporaryPassword
+
+  S3UserName:
+    Description: Name of the S3 user
+    Value: !Ref S3User
+
+  EC2UserName:
+    Description: Name of the EC2 user
+    Value: !Ref EC2User
+
+  LambdaFunctionName:
+    Description: Name of the created Lambda function
+    Value: !Ref LambdaFunctionName
